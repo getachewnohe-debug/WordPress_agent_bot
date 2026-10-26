@@ -1,0 +1,317 @@
+<?php
+/**
+ * File: includes/class-github-pr-client.php
+ *
+ * GitHub Pull Request API client.
+ * - Create, merge, close PRs
+ * - Request reviews
+ * - Add labels and comments
+ * - All actions gated by GitHub_Agent_Permission_Manager
+ */
+
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+final class GitHub_PR_Client {
+
+    /**
+     * Create a pull request.
+     *
+     * @param int    $user_id
+     * @param string $repo      owner/repo
+     * @param array  $pr {
+     *     @type string   $title         Required.
+     *     @type string   $head          Required. Branch to merge from.
+     *     @type string   $base          Required. Branch to merge into.
+     *     @type string   $body          Optional.
+     *     @type bool     $draft         Optional. Default false.
+     *     @type bool     $maintainer_can_modify  Optional. Default true.
+     * }
+     * @return array|WP_Error
+     */
+    public static function create_pr($user_id, $repo, array $pr) {
+        try {
+            GitHub_Agent_Permission_Manager::assert_can(
+                $user_id,
+                $repo,
+                'create_pr',
+                $pr['head'] ?? null
+            );
+        } catch (Exception $e) {
+            return new WP_Error('permission_denied', $e->getMessage(), array('status' => 403));
+        }
+
+        $repo = GitHub_Agent_Permission_Manager::normalize_repo_name($repo);
+
+        // Validate required fields.
+        foreach (array('title', 'head', 'base') as $field) {
+            if (empty(trim((string) ($pr[$field] ?? '')))) {
+                return new WP_Error(
+                    'missing_field',
+                    sprintf('PR field "%s" is required.', $field),
+                    array('status' => 400)
+                );
+            }
+        }
+
+        // Head and base must differ.
+        if (trim($pr['head']) === trim($pr['base'])) {
+            return new WP_Error(
+                'invalid_branches',
+                'Head and base branches must be different.',
+                array('status' => 400)
+            );
+        }
+
+        $payload = array(
+            'title'                  => sanitize_text_field($pr['title']),
+            'head'                   => sanitize_text_field($pr['head']),
+            'base'                   => sanitize_text_field($pr['base']),
+            'draft'                  => !empty($pr['draft']),
+            'maintainer_can_modify'  => isset($pr['maintainer_can_modify'])
+                                            ? (bool) $pr['maintainer_can_modify']
+                                            : true,
+        );
+
+        if (!empty($pr['body'])) {
+            $payload['body'] = wp_kses_post($pr['body']);
+        }
+
+        $response = GitHub_API_Client::post_raw(
+            sprintf('/repos/%s/pulls', $repo),
+            $payload
+        );
+
+        if (is_wp_error($response)) {
+            return $response;
+        }
+
+        do_action('github_agent_pr_created', $user_id, $repo, $response);
+
+        return $response;
+    }
+
+    /**
+     * Get a single pull request.
+     */
+    public static function get_pr($user_id, $repo, $pr_number) {
+        try {
+            GitHub_Agent_Permission_Manager::assert_can($user_id, $repo, 'read');
+        } catch (Exception $e) {
+            return new WP_Error('permission_denied', $e->getMessage(), array('status' => 403));
+        }
+
+        $repo = GitHub_Agent_Permission_Manager::normalize_repo_name($repo);
+
+        return GitHub_API_Client::get_raw(
+            sprintf('/repos/%s/pulls/%d', $repo, (int) $pr_number)
+        );
+    }
+
+    /**
+     * List open pull requests.
+     */
+    public static function list_prs($user_id, $repo, $args = array()) {
+        try {
+            GitHub_Agent_Permission_Manager::assert_can($user_id, $repo, 'read');
+        } catch (Exception $e) {
+            return new WP_Error('permission_denied', $e->getMessage(), array('status' => 403));
+        }
+
+        $repo = GitHub_Agent_Permission_Manager::normalize_repo_name($repo);
+
+        $valid_states = array('open', 'closed', 'all');
+        $state = in_array($args['state'] ?? 'open', $valid_states, true)
+            ? $args['state']
+            : 'open';
+
+        $per_page = min(100, max(1, (int) ($args['per_page'] ?? 30)));
+        $page     = max(1, (int) ($args['page'] ?? 1));
+
+        $query = http_build_query(array(
+            'state'    => $state,
+            'per_page' => $per_page,
+            'page'     => $page,
+        ));
+
+        return GitHub_API_Client::get_raw(
+            sprintf('/repos/%s/pulls?%s', $repo, $query)
+        );
+    }
+
+    /**
+     * Merge a pull request.
+     *
+     * @param array $options {
+     *     @type string $commit_title    Optional.
+     *     @type string $commit_message  Optional.
+     *     @type string $merge_method    merge|squash|rebase. Default merge.
+     *     @type string $sha             Required — must match PR head SHA.
+     * }
+     */
+    public static function merge_pr(
+        $user_id,
+        $repo,
+        $pr_number,
+        array $options = array(),
+        array $context = array()
+    ) {
+        // Fetch the PR first to get the base branch.
+        $pr = self::get_pr($user_id, $repo, $pr_number);
+        if (is_wp_error($pr)) {
+            return $pr;
+        }
+
+        $base_branch = $pr['base']['ref'] ?? null;
+
+        try {
+            GitHub_Agent_Permission_Manager::assert_can(
+                $user_id,
+                $repo,
+                'merge',
+                $base_branch,
+                null,
+                $context
+            );
+        } catch (Exception $e) {
+            return new WP_Error('permission_denied', $e->getMessage(), array('status' => 403));
+        }
+
+        // PR must be open.
+        if (($pr['state'] ?? '') !== 'open') {
+            return new WP_Error(
+                'pr_not_open',
+                sprintf('PR #%d is not open.', (int) $pr_number),
+                array('status' => 409)
+            );
+        }
+
+        // PR must not already be merged.
+        if (!empty($pr['merged'])) {
+            return new WP_Error(
+                'pr_already_merged',
+                sprintf('PR #%d is already merged.', (int) $pr_number),
+                array('status' => 409)
+            );
+        }
+
+        $repo = GitHub_Agent_Permission_Manager::normalize_repo_name($repo);
+
+        $valid_methods = array('merge', 'squash', 'rebase');
+        $merge_method  = in_array($options['merge_method'] ?? 'merge', $valid_methods, true)
+            ? $options['merge_method']
+            : 'merge';
+
+        $payload = array(
+            'merge_method' => $merge_method,
+        );
+
+        // SHA must match to prevent race conditions.
+        if (!empty($options['sha'])) {
+            $payload['sha'] = sanitize_text_field($options['sha']);
+        }
+
+        if (!empty($options['commit_title'])) {
+            $payload['commit_title'] = sanitize_text_field($options['commit_title']);
+        }
+
+        if (!empty($options['commit_message'])) {
+            $payload['commit_message'] = sanitize_textarea_field($options['commit_message']);
+        }
+                array('status' => 400)
+            );
+        }
+
+        $repo = GitHub_Agent_Permission_Manager::normalize_repo_name($repo);
+
+        // PR comments use the Issues comments endpoint.
+        $response = GitHub_API_Client::post_raw(
+            sprintf('/repos/%s/issues/%d/comments', $repo, (int) $pr_number),
+            array('body' => wp_kses_post($body))
+        );
+
+        if (is_wp_error($response)) {
+            return $response;
+        }
+
+        do_action('github_agent_pr_comment_added', $user_id, $repo, $pr_number, $response);
+
+        return $response;
+    }
+
+    /**
+     * Add labels to a pull request.
+     */
+    public static function add_labels($user_id, $repo, $pr_number, array $labels) {
+        try {
+            GitHub_Agent_Permission_Manager::assert_can(
+                $user_id,
+                $repo,
+                'create_pr'
+            );
+        } catch (Exception $e) {
+            return new WP_Error('permission_denied', $e->getMessage(), array('status' => 403));
+        }
+
+        if (empty($labels)) {
+            return new WP_Error(
+                'missing_labels',
+                'At least one label is required.',
+                array('status' => 400)
+            );
+        }
+
+        $repo = GitHub_Agent_Permission_Manager::normalize_repo_name($repo);
+
+        // Labels use the Issues labels endpoint.
+        $response = GitHub_API_Client::post_raw(
+            sprintf('/repos/%s/issues/%d/labels', $repo, (int) $pr_number),
+            array('labels' => array_map('sanitize_text_field', $labels))
+        );
+
+        if (is_wp_error($response)) {
+            return $response;
+        }
+
+        do_action('github_agent_pr_labels_added', $user_id, $repo, $pr_number, $labels);
+
+        return $response;
+    }
+}
+// Add these to class-github-api-client.php
+
+public static function get_raw($endpoint) {
+    return self::get($endpoint);
+}
+
+public static function post_raw($endpoint, $payload) {
+    return self::post($endpoint, $payload);
+}
+
+public static function patch_raw($endpoint, $payload) {
+    return self::patch($endpoint, $payload);
+}
+
+public static function put_raw($endpoint, $payload) {
+    $url = self::API_BASE . $endpoint;
+
+    $response = wp_remote_request($url, array(
+        'method'  => 'PUT',
+        'timeout' => self::TIMEOUT,
+        'headers' => self::headers(),
+        'body'    => wp_json_encode($payload),
+    ));
+
+    return self::parse_response($response);
+}
+Method              GitHub endpoint                                   Permission 
+─────────────────────────────────────────────────────────────────────────────────
+`create_pr()`       POST /repos/{repo}/pulls                          `create_pr`
+`get_pr()`          GET /repos/{repo}/pulls/{n}                       `read`     
+`list_prs()`        GET /repos/{repo}/pulls                           `read`     
+`merge_pr()`        PUT /repos/{repo}/pulls/{n}/merge                 `merge`    
+`close_pr()`        PATCH /repos/{repo}/pulls/{n}                     `create_pr`
+`request_review()`  POST /repos/{repo}/pulls/{n}/requested_reviewers  `review_pr`
+`add_pr_comment()`  POST /repos/{repo}/issues/{n}/comments            `create_pr`
+`add_labels()`      POST /repos/{repo}/issues/{n}/labels              `create_pr`
