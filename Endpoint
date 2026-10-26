@@ -1,0 +1,207 @@
+Payload URL:    https://yoursite.com/wp-json/github-agent/v1/webhook
+Content type:   application/json
+Secret:         (same value as GITHUB_WEBHOOK_SECRET in wp-config.php)
+Events:         Let me select individual events → push, pull_request, issueshttps://yoursite.com/wp-json/github-agent/v1/webhook
+                'type'        => 'string',
+                'required'    => false,
+            ),
+        );
+    }
+
+    /**
+     * Simple IP-based rate limiting via transients.
+     */
+    private static function check_rate_limit(WP_REST_Request $request) {
+        $ip  = self::get_client_ip();
+        $key = 'github_webhook_rl_' . md5($ip);
+
+        $count = (int) get_transient($key);
+
+        if ($count >= self::RATE_LIMIT) {
+            do_action('github_agent_rate_limited', $ip, $request);
+            return false;
+        }
+
+        if ($count === 0) {
+            set_transient($key, 1, self::RATE_WINDOW);
+        } else {
+            set_transient($key, $count + 1, self::RATE_WINDOW);
+        }
+
+        return true;
+    }
+
+    /**
+     * Safely resolve the client IP behind proxies.
+     */
+    private static function get_client_ip() {
+        $headers = array(
+            'HTTP_CF_CONNECTING_IP',   // Cloudflare
+            'HTTP_X_FORWARDED_FOR',    // Load balancers / proxies
+            'HTTP_X_REAL_IP',          // Nginx proxy
+            'REMOTE_ADDR',             // Direct
+        );
+
+        foreach ($headers as $header) {
+            if (!empty($_SERVER[$header])) {
+                $ip = trim(explode(',', $_SERVER[$header])[0]);
+                if (filter_var($ip, FILTER_VALIDATE_IP)) {
+                    return $ip;
+                }
+            }
+        }
+
+        return '0.0.0.0';
+    }
+}<?php
+/**
+ * Plugin Name: GitHub Agent
+ * Description: WordPress-safe GitHub agent with webhook handling and permission management.
+ * Version:     1.0.0
+ * Author:      getachewnohe-debug
+ */
+
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+// Define your webhook secret and API token in wp-config.php:
+// define('GITHUB_WEBHOOK_SECRET', 'your-secret-here');
+// define('GITHUB_API_TOKEN',      'ghp_your_token_here');
+
+// Autoload classes.
+$classes = array(
+    'GitHub_Agent_Permission_Manager' => 'class-github-agent-permissions.php',
+    'GitHub_Webhook_Handler'          => 'class-github-webhook-handler.php',
+    'GitHub_API_Client'               => 'class-github-api-client.php',
+    'GitHub_Webhook_Endpoint'         => 'class-github-webhook-endpoint.php',
+);
+
+foreach ($classes as $class => $file) {
+    if (!class_exists($class)) {
+        require_once plugin_dir_path(__FILE__) . 'includes/' . $file;
+    }
+}
+
+// Boot the endpoint.
+GitHub_Webhook_Endpoint::register();Add GitHub API client class (class-github-api-client.php)<?php
+/**
+ * File: includes/class-github-webhook-endpoint.php
+ *
+ * Registers the GitHub webhook REST endpoint.
+ * Route: POST /wp-json/github-agent/v1/webhook
+ *
+ * - No authentication required (GitHub signs payloads via HMAC)
+ * - Signature verification is handled inside GitHub_Webhook_Handler
+ * - Rate limiting via transients
+ */
+
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+final class GitHub_Webhook_Endpoint {
+
+    const NAMESPACE   = 'github-agent/v1';
+    const ROUTE       = '/webhook';
+    const RATE_LIMIT  = 100;   // max requests
+    const RATE_WINDOW = 60;    // per N seconds
+
+    /**
+     * Boot — call this on rest_api_init.
+     */
+    public static function register() {
+        add_action('rest_api_init', array(static::class, 'register_routes'));
+    }
+
+    /**
+     * Register REST routes.
+     */
+    public static function register_routes() {
+        register_rest_route(
+            self::NAMESPACE,
+            self::ROUTE,
+            array(
+                array(
+                    'methods'             => WP_REST_Server::CREATABLE, // POST
+                    'callback'            => array(static::class, 'handle'),
+                    'permission_callback' => array(static::class, 'check_permission'),
+                    'args'                => self::route_args(),
+                ),
+            )
+        );
+    }
+
+    /**
+     * Permission callback.
+     * GitHub webhooks are not authenticated via WP credentials.
+     * Signature verification happens inside the handler.
+     * We only reject here if the request is obviously malformed
+     * or rate-limited.
+     */
+    public static function check_permission(WP_REST_Request $request) {
+        // Must have a signature header.
+        $signature = $request->get_header('x-hub-signature-256');
+        if (empty($signature)) {
+            return new WP_Error(
+                'missing_signature',
+                'Missing webhook signature.',
+                array('status' => 401)
+            );
+        }
+
+        // Must have an event header.
+        $event = $request->get_header('x-github-event');
+        if (empty($event)) {
+            return new WP_Error(
+                'missing_event',
+                'Missing GitHub event header.',
+                array('status' => 400)
+            );
+        }
+
+        // Rate limiting by IP.
+        if (!self::check_rate_limit($request)) {
+            return new WP_Error(
+                'rate_limited',
+                'Too many requests.',
+                array('status' => 429)
+            );
+        }
+
+        return true;
+    }
+
+    /**
+     * Main callback — delegates to the handler.
+     */
+    public static function handle(WP_REST_Request $request) {
+        return GitHub_Webhook_Handler::handle($request);
+    }
+
+    /**
+     * Declare expected headers as route args for documentation.
+     * WP REST API does not enforce headers via args,
+     * but this makes the route self-documenting.
+     */
+    private static function route_args() {
+        return array(
+            'x-hub-signature-256' => array(
+                'description' => 'HMAC SHA-256 signature from GitHub.',
+                'type'        => 'string',
+                'required'    => false, // enforced in permission_callback
+            ),
+            'x-github-event' => array(
+                'description' => 'GitHub event name.',
+                'type'        => 'string',
+                'required'    => false,
+            ),
+            'x-github-delivery' => array(
+                'description' => 'Unique delivery GUID from GitHub.',
+github-agent/
+├── github-agent.php              ← main plugin file (bootstrap)
+└── includes/
+    ├── class-github-agent-permissions.php   ✅
+    ├── class-github-webhook-handler.php     ✅
+    ├── class-github-api-client.php          ✅
+    └── class-github-webhook-endpoint.php    ✅
