@@ -1,0 +1,313 @@
+
+            array('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s')
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Query interface
+    // -------------------------------------------------------------------------
+
+    /**
+     * Query log entries.
+     *
+     * @param array $args {
+     *     @type string $level     Filter by level.
+     *     @type string $event     Filter by event.
+     *     @type string $repo      Filter by repo.
+     *     @type string $actor     Filter by actor.
+     *     @type string $after     ISO datetime lower bound.
+     *     @type string $before    ISO datetime upper bound.
+     *     @type int    $per_page  Default 50.
+     *     @type int    $page      Default 1.
+     * }
+     * @return array { entries, total, pages }
+     */
+    public static function query(array $args = array()) {
+        global $wpdb;
+
+        $defaults = array(
+            'level'    => '',
+            'event'    => '',
+            'repo'     => '',
+            'actor'    => '',
+            'after'    => '',
+            'before'   => '',
+            'per_page' => 50,
+            'page'     => 1,
+        );
+
+        $args     = wp_parse_args($args, $defaults);
+        $table    = self::table();
+        $where    = array('1=1');
+        $params   = array();
+
+        if (!empty($args['level'])) {
+            $where[]  = 'level = %s';
+            $params[] = $args['level'];
+        }
+
+        if (!empty($args['event'])) {
+            $where[]  = 'event = %s';
+            $params[] = $args['event'];
+        }
+
+        if (!empty($args['repo'])) {
+            $where[]  = 'repo = %s';
+            $params[] = $args['repo'];
+        }
+
+        if (!empty($args['actor'])) {
+            $where[]  = 'actor = %s';
+            $params[] = $args['actor'];
+        }
+
+        if (!empty($args['after'])) {
+            $where[]  = 'created_at >= %s';
+            $params[] = $args['after'];
+        }
+
+        if (!empty($args['before'])) {
+            $where[]  = 'created_at <= %s';
+            $params[] = $args['before'];
+        }
+
+        $where_sql = implode(' AND ', $where);
+        $per_page  = max(1, min(200, (int) $args['per_page']));
+        $offset    = ($args['page'] - 1) * $per_page;
+
+        // Total count.
+        $count_sql = "SELECT COUNT(*) FROM {$table} WHERE {$where_sql}";
+        $total     = (int) $wpdb->get_var(
+            empty($params) ? $count_sql : $wpdb->prepare($count_sql, $params)
+        );
+
+        // Entries.
+        $query_sql = "SELECT * FROM {$table} WHERE {$where_sql} 
+                      ORDER BY created_at DESC 
+                      LIMIT %d OFFSET %d";
+
+        $query_params   = array_merge($params, array($per_page, $offset));
+        $entries        = $wpdb->get_results(
+            $wpdb->prepare($query_sql, $query_params),
+            ARRAY_A
+        );
+
+        // Decode context JSON.
+        foreach ($entries as &$entry) {
+            $entry['context'] = json_decode($entry['context'], true) ?? array();
+        }
+        unset($entry);
+
+        return array(
+            'entries' => $entries,
+            'total'   => $total,
+            'pages'   => (int) ceil($total / $per_page),
+        );
+    }
+
+    /**
+     * Delete log entries older than N days.
+     */
+    public static function prune($days = 30) {
+        global $wpdb;
+
+        $cutoff = gmdate('Y-m-d H:i:s', strtotime("-{$days} days"));
+            'level'   => 'info',
+            'event'   => 'issue_closed',
+            'repo'    => $repo,
+            'actor'   => self::wp_user_login($user_id),
+            'message' => sprintf('Issue #%d closed.', (int) $issue_number),
+            'context' => array(
+                'issue_number' => (int) $issue_number,
+                'issue_url'    => $response['html_url'] ?? null,
+            ),
+        ));
+    }
+
+    public static function on_comment_added($user_id, $repo, $issue_number, $response) {
+        self::write(array(
+            'level'   => 'info',
+            'event'   => 'issue_comment_added',
+            'repo'    => $repo,
+            'actor'   => self::wp_user_login($user_id),
+            'message' => sprintf('Comment added to issue #%d.', (int) $issue_number),
+            'context' => array(
+                'issue_number' => (int) $issue_number,
+                'comment_url'  => $response['html_url'] ?? null,
+            ),
+        ));
+    }
+
+    public static function on_rate_limited($ip, $request) {
+        self::write(array(
+            'level'   => 'warning',
+            'event'   => 'rate_limited',
+            'actor'   => $ip,
+            'message' => sprintf('Rate limit exceeded from IP: %s', $ip),
+            'context' => array(
+                'path' => $request->get_route(),
+            ),
+        ));
+    }
+
+    // -------------------------------------------------------------------------
+    // Write
+    // -------------------------------------------------------------------------
+
+    /**
+     * Write a log entry to the DB.
+     *
+     * @param array $entry {
+     *     @type string $level    info|warning|error
+     *     @type string $event    GitHub event or internal event name
+     *     @type string $delivery GitHub delivery GUID (optional)
+     *     @type string $repo     owner/repo (optional)
+     *     @type string $actor    GitHub login or WP username (optional)
+     *     @type string $message  Human-readable summary
+     *     @type array  $context  Raw payload or structured data
+     * }
+     */
+    public static function write(array $entry) {
+        global $wpdb;
+
+        $level = in_array($entry['level'] ?? '', self::LOG_LEVELS, true)
+            ? $entry['level']
+            : 'info';
+
+        $context_json = wp_json_encode($entry['context'] ?? array());
+
+        // Truncate oversized payloads.
+        if (strlen($context_json) > self::MAX_BODY_SIZE) {
+            $context_json = wp_json_encode(array(
+                '_truncated' => true,
+                '_size'      => strlen($context_json),
+            ));
+        }
+
+        $wpdb->insert(
+            self::table(),
+            array(
+                'level'      => $level,
+                'event'      => sanitize_text_field($entry['event']    ?? ''),
+                'delivery'   => sanitize_text_field($entry['delivery'] ?? ''),
+                'repo'       => sanitize_text_field($entry['repo']     ?? ''),
+                'actor'      => sanitize_text_field($entry['actor']    ?? ''),
+                'message'    => sanitize_text_field($entry['message']  ?? ''),
+                'context'    => $context_json,
+                'created_at' => current_time('mysql', true), // UTC
+            ),<?php
+/**
+ * File: includes/class-github-logger.php
+ *
+ * Persistent logger for GitHub agent events.
+ * - Creates a custom DB table on activation
+ * - Hooks into all do_action() log calls from the handler
+ * - Provides query interface for admin UI
+ */
+
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+final class GitHub_Logger {
+
+    const TABLE_VERSION = '1.0';
+    const LOG_LEVELS    = array('info', 'warning', 'error');
+    const MAX_BODY_SIZE = 65535; // ~64KB, fits TEXT column
+
+    /**
+     * Boot — call once from main plugin file.
+     */
+    public static function register() {
+        // Hook into handler's do_action calls.
+        add_action('github_agent_log_delivery',         array(static::class, 'on_delivery'),         10, 3);
+        add_action('github_agent_log_permission_denied',array(static::class, 'on_permission_denied'), 10, 2);
+        add_action('github_agent_log_handler_error',    array(static::class, 'on_handler_error'),     10, 3);
+        add_action('github_agent_issue_created',        array(static::class, 'on_issue_created'),     10, 3);
+        add_action('github_agent_issue_closed',         array(static::class, 'on_issue_closed'),      10, 4);
+        add_action('github_agent_issue_comment_added',  array(static::class, 'on_comment_added'),     10, 4);
+        add_action('github_agent_rate_limited',         array(static::class, 'on_rate_limited'),      10, 2);
+    }
+
+    // -------------------------------------------------------------------------
+    // Action callbacks
+    // -------------------------------------------------------------------------
+
+    public static function on_delivery($delivery, $event, $payload) {
+        self::write(array(
+            'level'    => 'info',
+            'event'    => $event,
+            'delivery' => $delivery,
+            'repo'     => self::extract_repo($payload),
+            'actor'    => self::extract_actor($payload),
+            'message'  => sprintf('Webhook received: %s', $event),
+            'context'  => $payload,
+        ));
+    }
+
+    public static function on_permission_denied($delivery, $message) {
+        self::write(array(
+            'level'    => 'warning',
+            'event'    => 'permission_denied',
+            'delivery' => $delivery,
+            'message'  => $message,
+            'context'  => array(),
+        ));
+    }
+
+    public static function on_handler_error($delivery, $event, $message) {
+        self::write(array(
+            'level'    => 'error',
+            'event'    => $event,
+            'delivery' => $delivery,
+            'message'  => $message,
+            'context'  => array(),
+        ));
+    }
+
+    public static function on_issue_created($user_id, $repo, $response) {
+        self::write(array(
+            'level'   => 'info',
+            'event'   => 'issue_created',
+            'repo'    => $repo,
+            'actor'   => self::wp_user_login($user_id),
+            'message' => sprintf(
+                'Issue #%d created: %s',
+                $response['number'] ?? 0,
+                $response['title']  ?? ''
+            ),
+            'context' => array(
+                'issue_number' => $response['number'] ?? null,
+                'issue_url'    => $response['html_url'] ?? null,
+            ),
+        ));
+    }
+
+    public static function on_issue_closed($user_id, $repo, $issue_number, $response) {
+        self::write(array(// Register logger hooks.
+GitHub_Logger::register();
+
+// Create table on activation.
+register_activation_hook(__FILE__, array('GitHub_Logger', 'create_table'));
+
+// Drop table on uninstall.
+register_uninstall_hook(__FILE__, array('GitHub_Logger', 'drop_table'));
+
+// Prune logs older than 30 days — runs daily.
+if (!wp_next_scheduled('github_agent_prune_logs')) {
+    wp_schedule_event(time(), 'daily', 'github_agent_prune_logs');
+}
+add_action('github_agent_prune_logs', function() {
+    GitHub_Logger::prune(30);
+});Column        Type          Purpose                         
+────────────────────────────────────────────────────────────
+`id`          BIGINT        Auto-increment PK               
+`level`       VARCHAR(10)   info / warning / error
+
+`event`       VARCHAR(100)  GitHub event name               
+`delivery`    VARCHAR(100)  GitHub delivery GUID            
+`repo`        VARCHAR(255)  owner/repo                      
+`actor`       VARCHAR(100)  GitHub login or WP username     
+`message`     VARCHAR(500)  Human-readable summary          
+`context`     TEXT          JSON payload (truncated at 64KB)
+`created_at`  DATETIME      UTC timestamp                   
