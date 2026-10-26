@@ -1,0 +1,305 @@
+<?php
+/**
+ * File: includes/class-github-agent-permissions.php
+ *
+ * WordPress-safe repo permission model for a GitHub agent.
+ * - Repo policies are explicit and allowlisted
+ * - User access is checked separately from GitHub App token permissions
+ * - Dangerous actions (write, merge, protected branch) require strict checks
+ */
+
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+final class GitHub_Agent_Permission_Manager {
+
+    /**
+     * Repository policy schema example:
+     *
+     * [
+     *   'enabled' => true,
+     *   'allowed_branches' => ['main', 'develop', 'staging'],
+     *   'allowed_file_patterns' => ['/src/**', '/docs/**'],
+     *   'blocked_file_patterns' => ['/.env', '/wp-config.php', '/config/secrets/**'],
+     *   'require_review' => true,
+     *   'require_manual_approval_for_main' => true,
+     *   'allowed_actions' => [
+     *       'read' => ['viewer', 'author', 'editor', 'admin'],
+     *       'create_issue' => ['author', 'editor', 'admin'],
+     *       'create_pr' => ['author', 'editor', 'admin'],
+     *       'push' => ['admin'],
+     *       'merge' => ['admin'],
+     *   ],
+     * ]
+     */
+    public static function repo_policy($repo) {
+        $repo = self::normalize_repo_name($repo);
+
+        $policies = get_option('github_agent_repo_policies', array());
+
+        if (!isset($policies[$repo])) {
+            return array(
+                'enabled' => false,
+                'allowed_branches' => array(),
+                'allowed_file_patterns' => array(),
+                'blocked_file_patterns' => array(),
+                'require_review' => true,
+                'require_manual_approval_for_main' => true,
+                'allowed_actions' => array(),
+            );
+        }
+
+        $policy = $policies[$repo];
+
+        $policy['enabled'] = !empty($policy['enabled']);
+        $policy['allowed_branches'] = !empty($policy['allowed_branches']) ? array_map('strval', $policy['allowed_branches']) : array();
+        $policy['allowed_file_patterns'] = !empty($policy['allowed_file_patterns']) ? array_map('strval', $policy['allowed_file_patterns']) : array();
+        $policy['blocked_file_patterns'] = !empty($policy['blocked_file_patterns']) ? array_map('strval', $policy['blocked_file_patterns']) : array();
+        $policy['require_review'] = !empty($policy['require_review']);
+        $policy['require_manual_approval_for_main'] = !empty($policy['require_manual_approval_for_main']);
+        $policy['allowed_actions'] = isset($policy['allowed_actions']) && is_array($policy['allowed_actions']) ? $policy['allowed_actions'] : array();
+
+        return $policy;
+    }
+
+    /**
+     * User repo policy per repo:
+     *
+     * [
+     *   'role' => 'author',
+     *   'permissions' => ['read', 'create_issue', 'create_pr'],
+     *   'allowed_branches' => ['develop', 'staging'],
+     * ]
+     */
+    public static function user_repo_policy($user_id, $repo) {
+        $repo = self::normalize_repo_name($repo);
+
+        $all_access = get_user_meta($user_id, 'github_repo_access', true);
+
+        if (!is_array($all_access)) {
+            return array(
+                'role' => 'none',
+                'permissions' => array(),
+                'allowed_branches' => array(),
+            );
+        }
+
+        if (!isset($all_access[$repo]) || !is_array($all_access[$repo])) {
+            return array(
+                'role' => 'none',
+                'permissions' => array(),
+                'allowed_branches' => array(),
+            );
+        }
+
+        $policy = $all_access[$repo];
+
+        $policy['role'] = isset($policy['role']) ? strtolower((string) $policy['role']) : 'none';
+        $policy['permissions'] = isset($policy['permissions']) && is_array($policy['permissions']) ? array_map('strval', $policy['permissions']) : array();
+        $policy['allowed_branches'] = isset($policy['allowed_branches']) && is_array($policy['allowed_branches']) ? array_map('strval', $policy['allowed_branches']) : array();
+
+        return $policy;
+    }
+
+    /**
+     * Main permission gate.
+     *
+     * Example:
+     * GitHub_Agent_Permission_Manager::can(
+     *   get_current_user_id(),
+     *   'acme/client-portal',
+     *   'create_pr',
+     *   'develop',
+     *   '/src/components/Form.php'
+     * );
+     */
+    public static function can($user_id, $repo, $action, $branch = null, $file_path = null, $context = array()) {
+        if (!is_numeric($user_id) || (int) $user_id <= 0) {
+            return false;
+        }
+
+        $repo = self::normalize_repo_name($repo);
+        $action = strtolower(trim((string) $action));
+        $branch = $branch ? trim((string) $branch) : null;
+        $file_path = $file_path ? trim((string) $file_path) : null;
+
+        $repo_policy = self::repo_policy($repo);
+        if (empty($repo_policy['enabled'])) {
+            return false;
+        }
+
+        $user_policy = self::user_repo_policy((int) $user_id, $repo);
+        if (empty($user_policy['permissions']) || !in_array($action, $user_policy['permissions'], true)) {
+            return false;
+        }
+
+        // If branch is restricted at repo level, enforce it.
+        if ($branch !== null && !empty($repo_policy['allowed_branches'])) {
+            if (!in_array($branch, $repo_policy['allowed_branches'], true)) {
+                return false;
+            }
+        }
+
+        // User-level branch restrictions.
+        if ($branch !== null && !empty($user_policy['allowed_branches'])) {
+            if (!in_array($branch, $user_policy['allowed_branches'], true)) {
+                return false;
+            }
+        }
+
+        // File path restrictions.
+        if ($file_path !== null) {
+            $normalized_path = self::normalize_file_path($file_path);
+
+            if (self::matches_any_pattern($normalized_path, $repo_policy['blocked_file_patterns'])) {
+                return false;
+            }
+
+            if (!empty($repo_policy['allowed_file_patterns']) && !self::matches_any_pattern($normalized_path, $repo_policy['allowed_file_patterns'])) {
+                return false;
+            }
+        }
+
+        // Production branch protections.
+        if ($branch !== null && self::is_production_branch($branch)) {
+            if (!empty($repo_policy['require_manual_approval_for_main'])) {
+                $manual_approval = !empty($context['manual_approval']) && $context['manual_approval'] === true;
+
+                if (!$manual_approval) {
+                    return false;
+                }
+            }
+        }
+
+        // If a repo policy defines allowed_actions by role, enforce it.
+        $role = $user_policy['role'];
+        $allowed_by_role = self::activity_allowed_for_role($repo_policy, $action, $role);
+
+        if (!$allowed_by_role) {
+            return false;
+        }
+
+        return true;
+    }
+
+    public static function assert_can($user_id, $repo, $action, $branch = null, $file_path = null, $context = array()) {
+        if (!self::can($user_id, $repo, $action, $branch, $file_path, $context)) {
+            $message = sprintf(
+                'User %d is not allowed to perform action "%s" on repo "%s".',
+                (int) $user_id,
+                $action,
+                $repo
+            );
+
+            if ($branch) {
+                $message .= sprintf(' Branch: %s.', $branch);
+            }
+
+            if ($file_path) {
+                $message .= sprintf(' File: %s.', $file_path);
+            }
+
+            throw new Exception($message);
+        }
+
+        return true;
+    }
+
+    public static function normalize_repo_name($repo) {
+        $repo = trim((string) $repo);
+        $repo = preg_replace('#^https?://github\.com/#i', '', $repo);
+        $repo = trim($repo, '/');
+        $repo = str_replace('\\', '/', $repo);
+
+        // Keep owner/repo only.
+        $parts = explode('/', $repo);
+        if (count($parts) >= 2) {
+            $owner = sanitize_key($parts[0]);
+            $name  = sanitize_key($parts[1]);
+            return $owner . '/' . $name;
+        }
+
+        return sanitize_key($repo);
+    }
+
+    public static function normalize_file_path($file_path) {
+        $path = str_replace('\\', '/', (string) $file_path);
+        $path = preg_replace('#/+#', '/', $path);
+        $path = preg_replace('#^/#', '', $path);
+
+        return '/' . ltrim($path, '/');
+    }
+
+    private static function matches_any_pattern($path, $patterns) {
+        if (!is_array($patterns) || empty($patterns)) {
+            return false;
+        }
+
+        foreach ($patterns as $pattern) {
+            $pattern = trim((string) $pattern);
+
+            if ($pattern === '') {
+                continue;
+            }
+
+            $pattern = self::normalize_file_pattern($pattern);
+            $path = self::normalize_file_path($path);
+
+            if (self::glob_match($path, $pattern)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static function normalize_file_pattern($pattern) {
+        $pattern = str_replace('\\', '/', (string) $pattern);
+        $pattern = trim($pattern);
+
+        if ($pattern === '') {
+            return '/';
+        }
+
+        if (!preg_match('#^/#', $pattern)) {
+            $pattern = '/' . $pattern;
+        }
+
+        $pattern = preg_replace('#/+#', '/', $pattern);
+
+        return $pattern;
+    }
+
+    private static function glob_match($value, $pattern) {
+        $pattern = preg_quote($pattern, '/');
+
+        // Convert glob-style * and ** to regex.
+        $pattern = str_replace('\*', '.*', $pattern);
+        $pattern = str_replace('\*\*', '.*', $pattern);
+
+        $regex = '/^' . $pattern . '$/i';
+
+        return (bool) preg_match($regex, $value);
+    }
+
+    private static function activity_allowed_for_role($repo_policy, $action, $role) {
+        if (!isset($repo_policy['allowed_actions']) || !is_array($repo_policy['allowed_actions'])) {
+            return true;
+        }
+
+        $allowed_actions = $repo_policy['allowed_actions'];
+
+        if (!isset($allowed_actions[$action]) || !is_array($allowed_actions[$action])) {
+            return true;
+        }
+
+        return in_array($role, $allowed_actions[$action], true);
+    }
+
+    private static function is_production_branch($branch) {
+        $branch = strtolower((string) $branch);
+
+        return in_array($branch, array('main', 'master', 'production', 'prod'), true);
+    }
+}
